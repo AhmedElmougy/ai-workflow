@@ -17,7 +17,7 @@ esac
 
 case "$FILE" in
   *.py)
-    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"Python file changed. Before final answer, run focused verification and inspect diff. If this introduced a durable structural discovery outside timebox/interview mode, update .ai memory/index."}}'
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"Python file changed. Before final answer, run focused verification and inspect diff, then report the exact command verbatim so it can be re-run independently. Pressure-test any new literal threshold/count: derived from an observed run, or guessed? If this introduced a durable structural discovery outside timebox/interview mode, update .ai memory/index."}}'
     ;;
   *.js|*.ts|*.tsx|*.jsx|*.html|*.css|*.sh|*.yaml|*.yml|*.toml)
     printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"Source/config file changed. Before final answer, run focused verification and inspect diff. Memory update is conditional, not mandatory."}}'

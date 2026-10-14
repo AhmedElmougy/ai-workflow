@@ -19,7 +19,8 @@ Find and run the smallest meaningful verification for a change.
    - bad expectation
    - fixture/environment issue
    - unrelated existing failure
-5. Report actual command and result.
+5. Pressure-test any new literal threshold/count the assertion depends on: state where the number came from (an observed run, not a guess), and confirm it fails against pre-fix code and passes against post-fix code for the stated reason.
+6. Report the exact command verbatim (copy-pasteable) and result.
 
 ## Output
 

@@ -15,7 +15,8 @@ Perform a final independent review of the changed files before reporting complet
 - Are there unintended refactors or formatting-only changes?
 - Are edge cases, permissions, validation, and error behavior handled where relevant?
 - Are tests aligned with behavior rather than implementation details?
-- Were checks actually run and accurately reported?
+- Does any new assertion depend on a literal threshold/count? If so, was it derived from an observed run (not guessed), and does it fail pre-fix / pass post-fix for the stated reason?
+- Were checks actually run and accurately reported, with the exact command stated verbatim?
 - Are there unsupported assumptions to disclose?
 - Does any new comment restate the code, narrate this specific change ("fixed for X", "per the bug report"), or reference task/PR context? That belongs in the commit message, not the code — remove it. A comment only earns its place if it explains something the code can't: a constraint, invariant, or non-obvious workaround.
 

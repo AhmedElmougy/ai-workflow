@@ -44,7 +44,7 @@ def top_level() -> str:
         if path.name == ".ai":
             continue
         kind = "dir" if path.is_dir() else "file"
-        rows.append(f"- `{path.name}` — {kind}")
+        rows.append(f"- [{path.name}]({path.name}) — {kind}")
     return "\n".join(rows) or "_No files found._"
 
 
@@ -71,17 +71,22 @@ def django_apps() -> str:
             ]
             if (app_dir / "tests").exists():
                 files.append("tests/")
-            rows.append(f"- `{rel(app_dir)}` — {', '.join(files) or 'app config only'}")
+            app_rel = rel(app_dir)
+            rows.append(f"- [{app_rel}]({app_rel}) — {', '.join(files) or 'app config only'}")
     return "\n".join(rows) or "_No Django apps detected._"
 
 
 def urls() -> str:
-    rows = [f"- `{rel(path)}`" for path in sorted(ROOT.rglob("urls.py")) if not skip(path)]
+    rows = [f"- [{rel(path)}]({rel(path)})" for path in sorted(ROOT.rglob("urls.py")) if not skip(path)]
     return "\n".join(rows) or "_No URL modules detected._"
 
 
+TEST_FILE_PATTERNS = ["test*.py", "*.test.js", "*.test.jsx", "*.test.ts", "*.test.tsx", "*.spec.js", "*.spec.ts"]
+
+
 def tests() -> str:
-    rows = [f"- `{rel(path)}`" for path in sorted(ROOT.rglob("test*.py")) if not skip(path)]
+    found = {path for pattern in TEST_FILE_PATTERNS for path in ROOT.rglob(pattern) if not skip(path)}
+    rows = [f"- [{rel(path)}]({rel(path)})" for path in sorted(found)]
     return "\n".join(rows) or "_No tests detected._"
 
 
@@ -99,6 +104,32 @@ def file_symbols(path: Path) -> list[str]:
     return [f"{label} L{line}" for line, label in sorted(symbols)[:20]]
 
 
+_JS_CLASS_RE = re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)", re.MULTILINE)
+_JS_FUNCTION_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|"
+    r"^\s*(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(",
+    re.MULTILINE,
+)
+
+
+def js_file_symbols(path: Path) -> list[str]:
+    # Regex, not a real parser (no tree-sitter/esprima dependency) — best-effort only,
+    # mirrors the Python ast walk closely enough to be useful, not exhaustive.
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+    symbols = []
+    for match in _JS_CLASS_RE.finditer(text):
+        line = text.count("\n", 0, match.start()) + 1
+        symbols.append((line, f"class `{match.group(1)}`"))
+    for match in _JS_FUNCTION_RE.finditer(text):
+        name = match.group(1) or match.group(2)
+        line = text.count("\n", 0, match.start()) + 1
+        symbols.append((line, f"function `{name}`"))
+    return [f"{label} L{line}" for line, label in sorted(symbols)[:20]]
+
+
 def symbols() -> str:
     rows = []
     for path in sorted(ROOT.rglob("*.py")):
@@ -106,8 +137,17 @@ def symbols() -> str:
             continue
         syms = file_symbols(path)
         if syms:
-            rows.append(f"- `{rel(path)}` — " + "; ".join(syms))
-    return "\n".join(rows) or "_No Python symbols detected._"
+            path_rel = rel(path)
+            rows.append(f"- [{path_rel}]({path_rel}) — " + "; ".join(syms))
+    for ext in (".js", ".jsx", ".ts", ".tsx"):
+        for path in sorted(ROOT.rglob(f"*{ext}")):
+            if skip(path) or "node_modules" in path.parts:
+                continue
+            syms = js_file_symbols(path)
+            if syms:
+                path_rel = rel(path)
+                rows.append(f"- [{path_rel}]({path_rel}) — " + "; ".join(syms))
+    return "\n".join(rows) or "_No Python/JS/TS symbols detected._"
 
 
 def _pre_commit_tools(text: str) -> list[str]:
@@ -132,12 +172,22 @@ def _makefile_targets(text: str) -> list[str]:
     return targets
 
 
-def _package_json_lint_scripts(text: str) -> list[str]:
+def _package_json_scripts(text: str) -> dict[str, str]:
     try:
-        scripts = json.loads(text).get("scripts", {})
+        return json.loads(text).get("scripts", {})
     except Exception:
-        return []
-    return [k for k in scripts if any(kw in k for kw in ("lint", "format"))]
+        return {}
+
+
+NPM_SCRIPT_HINTS = {
+    "dev": "run in dev mode (watch/reload)",
+    "start": "run once",
+    "build": "build for production",
+    "test": "run test suite",
+    "lint": "lint",
+    "lint:fix": "lint, auto-fixing what it can",
+    "format": "format code",
+}
 
 
 def _pre_commit_row(text: str) -> str | None:
@@ -155,18 +205,54 @@ def _pyproject_row(text: str) -> str | None:
     return f"- `pyproject.toml` configures: {', '.join(f'[tool.{s}]' for s in relevant)}"
 
 
+# Conventional target names this generator recognizes across Docker/Django-style Makefiles,
+# in a sensible "how you'd actually use this repo" order. Only the ones present are shown,
+# so repo-init hands over runnable commands, not just a name list the agent re-derives.
+QUICK_COMMAND_HINTS = {
+    "up": "start the stack",
+    "upbuild": "build + start the stack",
+    "down": "stop the stack",
+    "run": "run a one-off command in a fresh container",
+    "test": "run full test suite (fresh db)",
+    "test-lite": "run tests fast (reuse db, skip migrations) — pass a path/node-id to scope it",
+    "test-debug": "run tests, drop into --pdb on failure",
+    "migrate": "apply migrations",
+    "makemigrations": "create new migrations",
+    "showmigrations": "list migrations + applied state",
+    "shell": "Django shell (shell_plus if installed)",
+    "bash": "shell into the app container",
+    "psql": "psql into the project db",
+    "logs": "tail container logs",
+    "manage": "run any manage.py subcommand",
+}
+
+
+def _quick_commands_rows(found_targets: list[str]) -> list[str]:
+    present = [t for t in QUICK_COMMAND_HINTS if t in found_targets]
+    if not present:
+        return []
+    return ["- Quick commands:", *(f"  - `make {t}` — {QUICK_COMMAND_HINTS[t]}" for t in present)]
+
+
 def _makefile_row(text: str) -> str | None:
     found = _makefile_targets(text)
     if not found:
         return None
-    return f"- Makefile targets: {', '.join(found)} — run via `make <target>`"
+    lines = [f"- Makefile targets: {', '.join(found)} — run via `make <target>`"]
+    lines.extend(_quick_commands_rows(found))
+    return "\n".join(lines)
 
 
 def _package_json_row(text: str) -> str | None:
-    found = _package_json_lint_scripts(text)
-    if not found:
+    scripts = _package_json_scripts(text)
+    if not scripts:
         return None
-    return "- package.json scripts: " + ", ".join(f"`{k}`" for k in found)
+    lines = ["- package.json scripts: " + ", ".join(f"`{k}`" for k in scripts) + " — run via `npm run <script>`"]
+    present = [k for k in NPM_SCRIPT_HINTS if k in scripts]
+    if present:
+        lines.append("- Quick commands:")
+        lines.extend(f"  - `npm run {k}` — {NPM_SCRIPT_HINTS[k]}" for k in present)
+    return "\n".join(lines)
 
 
 # Config sources read here, with mtimes recorded below so a consumer can tell if this section is stale.

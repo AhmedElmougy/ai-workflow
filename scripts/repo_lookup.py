@@ -18,8 +18,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 REPO_MAP = ROOT / ".ai" / "repo-map.md"
-IGNORE_PARTS = {".git", "__pycache__", ".venv", "venv", "node_modules", "migrations", "_build", ".ai"}
+# interview_prep holds this repo's own answer key — never a legitimate source hit, and
+# ranking it in would spoil the self-practice exercise the rest of .ai/ is built around.
+IGNORE_PARTS = {".git", "__pycache__", ".venv", "venv", "node_modules", "migrations", "_build", ".ai", "interview_prep"}
 CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".scss", ".yml", ".yaml", ".toml", ".md"}
+_CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
 
 
 def rel(path: Path) -> str:
@@ -30,16 +33,41 @@ def skip(path: Path) -> bool:
     return any(part in IGNORE_PARTS for part in path.parts)
 
 
+MIN_LEN_TO_SINGULARIZE = 3
+
+
+def _singular(tok: str) -> str:
+    return tok[:-1] if len(tok) > MIN_LEN_TO_SINGULARIZE and tok.endswith("s") and not tok.endswith("ss") else tok
+
+
 def tokens(text: str) -> list[str]:
+    """Split on `_`, digits, and camelCase/PascalCase boundaries; normalize simple plurals.
+
+    "ServiceTaskCategory" -> service, task, category (not one opaque 20-char blob) so it
+    can match plain-word paths like src/maintenance/services.py.
+    """
     raw = re.findall(r"[A-Za-z0-9_]+", text)
     out: list[str] = []
     for item in raw:
-        out.extend(part.lower() for part in item.split("_") if len(part) > 1)
+        for underscore_part in item.split("_"):
+            for camel_part in _CAMEL_RE.findall(underscore_part):
+                low = camel_part.lower()
+                if len(low) > 1:
+                    out.append(_singular(low))
     return out
 
 
 def candidate_files() -> list[Path]:
     return sorted(path for path in ROOT.rglob("*") if path.is_file() and not skip(path) and path.suffix in CODE_EXTS)
+
+
+def is_test_path(rel_lower: str, filename_lower: str) -> bool:
+    # Covers Django's nested per-app `tests/` *and* a root-level `tests/` dir (common
+    # in JS/Node), plus pytest's `test_*.py` *and* Jest/Mocha's `*.test.js`/`*.spec.ts`.
+    parts = rel_lower.split("/")
+    if "tests" in parts or "test" in parts:
+        return True
+    return filename_lower.startswith("test") or bool(re.search(r"\.(test|spec)\.\w+$", filename_lower))
 
 
 def score_path(path: Path, query_tokens: list[str]) -> tuple[int, list[str]]:
@@ -58,11 +86,14 @@ def score_path(path: Path, query_tokens: list[str]) -> tuple[int, list[str]]:
         elif term in r:
             score += 2
             reasons.append(f"path-substr:{term}")
-    if "/tests/" in r or path.name.startswith("test"):
+    if is_test_path(r, name):
         score += 1
     if path.name in ("__init__.py", "conftest.py"):
         score -= 8
     return score, reasons[:4]
+
+
+PER_FILE_MATCH_CAP = 5  # bounds output per file so one hot file can't starve every other match
 
 
 def _run_rg(pattern: str) -> subprocess.CompletedProcess[str]:
@@ -71,6 +102,8 @@ def _run_rg(pattern: str) -> subprocess.CompletedProcess[str]:
             "rg",
             "-n",
             "--ignore-case",
+            "--max-count",
+            str(PER_FILE_MATCH_CAP),
             "--glob",
             "!.ai/**",
             "--glob",
@@ -79,6 +112,8 @@ def _run_rg(pattern: str) -> subprocess.CompletedProcess[str]:
             "!locale/**",
             "--glob",
             "!**/migrations/**",
+            "--glob",
+            "!interview_prep/**",
             pattern,
             str(ROOT),
         ],
@@ -99,10 +134,12 @@ def _run_grep(pattern: str) -> subprocess.CompletedProcess[str]:
             "-rn",
             "-i",
             "-E",
+            f"-m{PER_FILE_MATCH_CAP}",
             "--exclude-dir=.ai",
             "--exclude-dir=docs",
             "--exclude-dir=locale",
             "--exclude-dir=migrations",
+            "--exclude-dir=interview_prep",
             "--exclude-dir=.git",
             "--exclude-dir=node_modules",
             "--exclude-dir=venv",
@@ -119,7 +156,8 @@ def _run_grep(pattern: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def rg_hits(query_tokens: list[str], limit: int = 80) -> dict[str, list[str]]:
+def rg_hits(query_tokens: list[str], limit: int = 2000) -> dict[str, list[str]]:
+    # Per-file cap (PER_FILE_MATCH_CAP) already bounds output; this is just a sanity ceiling.
     if not query_tokens:
         return {}
     pattern = "|".join(re.escape(t) for t in sorted(set(query_tokens), key=len, reverse=True))
@@ -152,11 +190,11 @@ def extract_symbols_for(files: list[str]) -> dict[str, list[str]]:
         return symbols
     text = REPO_MAP.read_text(encoding="utf-8", errors="ignore")
     for line in text.splitlines():
-        if not line.startswith("- `") or " — " not in line:
+        match = re.match(r"^- \[([^\]]+)\]\([^)]*\) — (.+)$", line)
+        if not match:
             continue
-        path = line.split("`", 2)[1]
+        path, syms = match.group(1), match.group(2)
         if path in files:
-            syms = line.split(" — ", 1)[1]
             symbols[path] = [s.strip() for s in syms.split(";")[:12]]
     return symbols
 
@@ -183,7 +221,7 @@ def suggested_tests(ranked_files: list[str], all_files: list[Path], query_tokens
     for path in all_files:
         r = rel(path)
         low = r.lower()
-        if "/tests/" not in low and not path.name.startswith("test"):
+        if not is_test_path(low, path.name.lower()):
             continue
         score = _test_score(low, domains, query_tokens)
         if score:
@@ -192,15 +230,14 @@ def suggested_tests(ranked_files: list[str], all_files: list[Path], query_tokens
 
 
 def verification_command(tests: list[str]) -> str:
+    is_python_repo = any((ROOT / name).exists() for name in ("pyproject.toml", "pytest.ini", "setup.cfg", "manage.py"))
+    if not is_python_repo and (ROOT / "package.json").exists():
+        if tests:
+            return f"npx jest {tests[0]}  # or your repo's actual test runner"
+        return "npm test"
     if not tests:
         return "pytest -q  # or project-specific focused test command"
     first = tests[0]
-    if (
-        Path(ROOT / "pyproject.toml").exists()
-        or Path(ROOT / "pytest.ini").exists()
-        or Path(ROOT / "setup.cfg").exists()
-    ):
-        return f"pytest {first} -q"
     if Path(ROOT / "manage.py").exists():
         module = first.removesuffix(".py").replace("/", ".")
         return f"python manage.py test {module}"
@@ -212,7 +249,7 @@ def lookup(query: str, max_files: int, max_snippets: int) -> str:
     files = candidate_files()
     path_scores, reasons = _score_candidates(files, q_tokens)
     hits = rg_hits(q_tokens)
-    _apply_text_matches(path_scores, reasons, hits)
+    _apply_text_matches(path_scores, reasons, hits, q_tokens)
 
     ranked = [r for r, _ in sorted(path_scores.items(), key=lambda item: (-item[1], item[0]))[:max_files]]
     symbols = extract_symbols_for(ranked)
@@ -225,9 +262,9 @@ def lookup(query: str, max_files: int, max_snippets: int) -> str:
     out.extend(("", "Nearby tests:"))
     out.extend(_format_tests(tests))
     out.extend(("", "Suggested reads:"))
-    out.extend(f"- `{file_rel}`" for file_rel in ranked[:5])
-    out.extend(f"- `{test}`" for test in tests[:2] if test not in ranked[:5])
-    out.extend(("", "Suggested verification:", f"- `{verification_command(tests)}`", ""))
+    out.extend(f"- [{file_rel}]({file_rel})" for file_rel in ranked[:5])
+    out.extend(f"- [{test}]({test})" for test in tests[:2] if test not in ranked[:5])
+    out.extend(("", "Suggested verification:", "```bash", verification_command(tests), "```", ""))
     out.append("Note: This is a navigation aid. Verify behavior against source and tests before editing.")
     return "\n".join(out)
 
@@ -244,11 +281,26 @@ def _score_candidates(files: list[Path], q_tokens: list[str]) -> tuple[dict[str,
     return path_scores, reasons
 
 
-def _text_match_bonus(file_rel: str, snippet_count: int) -> int:
-    bonus = 8 + min(snippet_count, 5) * 2
+def _token_weight(tok: str) -> int:
+    # Longer tokens are rarer/more specific (e.g. "servicetaskcategory" vs "get"/"api") —
+    # a crude IDF stand-in that costs no extra pass over the repo.
+    return min(len(tok), 12)
+
+
+def _matched_tokens(snippets: list[str], query_tokens: list[str]) -> set[str]:
+    text = " ".join(snippets).lower()
+    return {t for t in query_tokens if t in text}
+
+
+def _text_match_bonus(file_rel: str, snippets: list[str], query_tokens: list[str]) -> int:
+    matched = _matched_tokens(snippets, query_tokens)
+    bonus = sum(_token_weight(t) for t in matched)
+    if len(matched) > 1:
+        # Reward distinct query-token coverage, not just many lines of one common word.
+        bonus += 4 * (len(matched) - 1)
     if file_rel.startswith(("src/", "config/")):
         bonus += 4
-    if "/tests/" in file_rel or Path(file_rel).name.startswith("test"):
+    if is_test_path(file_rel.lower(), Path(file_rel).name.lower()):
         bonus += 3
     if file_rel.startswith(("docs/", "locale/", "fixtures/")) or file_rel.endswith(".md"):
         bonus -= 8
@@ -261,9 +313,10 @@ def _apply_text_matches(
     path_scores: dict[str, int],
     reasons: dict[str, list[str]],
     hits: dict[str, list[str]],
+    query_tokens: list[str],
 ) -> None:
     for file_rel, snippets in hits.items():
-        path_scores[file_rel] = path_scores.get(file_rel, 0) + _text_match_bonus(file_rel, len(snippets))
+        path_scores[file_rel] = path_scores.get(file_rel, 0) + _text_match_bonus(file_rel, snippets, query_tokens)
         reasons.setdefault(file_rel, []).append("text-match")
 
 
@@ -278,19 +331,19 @@ def _format_likely_files(
     lines: list[str] = []
     for i, file_rel in enumerate(ranked, 1):
         why = ", ".join(dict.fromkeys(reasons.get(file_rel, []))) or "ranked match"
-        lines.append(f"{i}. `{file_rel}`")
+        lines.append(f"{i}. [{file_rel}]({file_rel})")
         lines.append(f"   reason: {why}")
         lines.extend(f"   - {snippet}" for snippet in hits.get(file_rel, [])[:max_snippets])
     return lines
 
 
 def _format_symbols(ranked: list[str], symbols: dict[str, list[str]]) -> list[str]:
-    lines = [f"- `{file_rel}` — {sym}" for file_rel in ranked for sym in symbols.get(file_rel, [])[:8]]
+    lines = [f"- [{file_rel}]({file_rel}) — {sym}" for file_rel in ranked for sym in symbols.get(file_rel, [])[:8]]
     return lines or ["- No symbols found in repo map for ranked files."]
 
 
 def _format_tests(tests: list[str]) -> list[str]:
-    return [f"- `{t}`" for t in tests] or ["- No nearby tests found from map/path matching."]
+    return [f"- [{t}]({t})" for t in tests] or ["- No nearby tests found from map/path matching."]
 
 
 def main() -> None:
